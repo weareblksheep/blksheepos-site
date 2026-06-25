@@ -1,0 +1,155 @@
+name: static-guard
+
+# Lightweight, dependency-free guard for the static coming-soon page.
+# Validates required SEO/social metadata and enforces the "self-contained,
+# no third-party surface" rule from CLAUDE.md. Uses only the Python 3 and
+# shell that ship on GitHub-hosted runners — no package.json, no lockfile,
+# no build step, no third-party actions beyond actions/checkout.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  static-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate static surface
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          from html.parser import HTMLParser
+
+          OWN_ORIGIN = "https://blksheepos.com/"
+          OWN_HOST = "blksheepos.com"
+          HTML = "index.html"
+
+          errors = []
+          def fail(msg): errors.append(msg)
+
+          # --- Gate: index.html exists -------------------------------------
+          if not os.path.isfile(HTML):
+              print("FAIL: index.html not found at repo root")
+              sys.exit(1)
+
+          with open(HTML, encoding="utf-8") as f:
+              html = f.read()
+
+          # --- Parse head metadata and asset-bearing attributes ------------
+          class P(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.meta = {}          # property/name -> content
+                  self.canonical = None
+                  self.script_srcs = []   # external-capable <script src>
+                  self.assets = []        # (tag, attr, value) local-ref candidates
+              def handle_starttag(self, tag, attrs):
+                  a = {k.lower(): (v or "") for k, v in attrs}
+                  if tag == "meta":
+                      key = a.get("property") or a.get("name")
+                      if key:
+                          self.meta[key.lower()] = a.get("content", "")
+                  if tag == "link" and "stylesheet" in a.get("rel", "").lower():
+                      if a.get("href"):
+                          self.assets.append(("link", "href", a["href"]))
+                  if tag == "link" and a.get("rel", "").lower() == "canonical":
+                      self.canonical = a.get("href", "")
+                  if tag == "script" and a.get("src"):
+                      self.script_srcs.append(a["src"])
+                  for attr in ("src", "href"):
+                      if attr in a and a[attr]:
+                          self.assets.append((tag, attr, a[attr]))
+          p = P(); p.feed(html)
+
+          def is_external(url):
+              u = url.strip()
+              if u.startswith("//"):
+                  return True
+              m = re.match(r"https?://([^/]+)", u, re.I)
+              if not m:
+                  return False
+              return m.group(1).lower().split(":")[0] != OWN_HOST
+
+          # --- Gate: canonical -> own origin -------------------------------
+          if not p.canonical:
+              fail("missing <link rel=canonical>")
+          elif p.canonical.strip() != OWN_ORIGIN:
+              fail(f"canonical is '{p.canonical}', expected '{OWN_ORIGIN}'")
+
+          # --- Gate: og:url -> own origin ----------------------------------
+          ogurl = p.meta.get("og:url", "")
+          if ogurl.strip() != OWN_ORIGIN:
+              fail(f"og:url is '{ogurl}', expected '{OWN_ORIGIN}'")
+
+          # --- Gate: required OG + Twitter text tags exist -----------------
+          for key in ("og:title", "og:description",
+                      "twitter:card", "twitter:title", "twitter:description"):
+              if not p.meta.get(key, "").strip():
+                  fail(f"missing or empty meta '{key}'")
+
+          # --- Gate: no external <script src> ------------------------------
+          for s in p.script_srcs:
+              if is_external(s):
+                  fail(f"external <script src> not allowed: {s}")
+
+          # --- Gate: no analytics / CDN / external font references ---------
+          ANALYTICS = [
+              "google-analytics.com", "googletagmanager.com", "gtag(", "ga(",
+              "analytics.js", "segment.com", "segment.io", "mixpanel",
+              "plausible.io", "usefathom.com", "fathom", "hotjar",
+              "amplitude", "matomo", "posthog", "clarity.ms",
+          ]
+          CDN = [
+              "cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com",
+              "ajax.googleapis.com", "stackpath", "bootstrapcdn",
+              "code.jquery.com", "//cdn.", "https://cdn.", "http://cdn.",
+          ]
+          FONTS = [
+              "fonts.googleapis.com", "fonts.gstatic.com",
+              "use.typekit.net", "p.typekit.net", "@font-face",
+          ]
+          low = html.lower()
+          for needle in ANALYTICS:
+              if needle.lower() in low:
+                  fail(f"analytics reference detected: '{needle}'")
+          for needle in CDN:
+              if needle.lower() in low:
+                  fail(f"CDN reference detected: '{needle}'")
+          for needle in FONTS:
+              if needle.lower() in low:
+                  fail(f"external font reference detected: '{needle}'")
+
+          # --- Gate: no off-origin http(s) asset refs (own origin OK) ------
+          # Allowed: https://blksheepos.com/* anywhere (canonical/OG/Twitter
+          # metadata + any same-origin link). Anything else off-origin fails.
+          for url in re.findall(r"https?://[^\s\"'<>)]+", html):
+              if is_external(url):
+                  fail(f"off-origin URL reference not allowed: {url}")
+          for url in re.findall(r'["\'](//[^\s"\'<>)]+)', html):
+              fail(f"scheme-relative (off-origin) URL not allowed: {url}")
+
+          # --- Gate: local referenced assets exist -------------------------
+          SKIP = ("http://", "https://", "//", "mailto:", "tel:", "data:", "#", "javascript:")
+          for tag, attr, val in p.assets:
+              v = val.strip()
+              if not v or v.lower().startswith(SKIP):
+                  continue
+              path = v.split("?")[0].split("#")[0].lstrip("/")
+              if not os.path.isfile(path):
+                  fail(f"referenced local asset missing: {tag} {attr}=\"{val}\"")
+
+          # --- Report ------------------------------------------------------
+          if errors:
+              print("static-guard: FAIL")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          print("static-guard: PASS — metadata present, no third-party/off-origin surface, local assets resolve")
+          PY
